@@ -206,6 +206,18 @@ def resolve_title(
     refresh: bool = False,
 ) -> tuple[Title, MediaProvider]:
     """Turn a user reference into a fully loaded Title plus its provider."""
+    title, provider = _resolve_title(reference, providers=providers, kind=kind, refresh=refresh)
+    title.slug = title.url_slug          # providers fill the name in after construction
+    return title, provider
+
+
+def _resolve_title(
+    reference: str,
+    *,
+    providers: Sequence[str] | None = None,
+    kind: str | None = None,
+    refresh: bool = False,
+) -> tuple[Title, MediaProvider]:
     reference = (reference or "").strip()
     if not reference:
         raise ProviderError("nothing to resolve (empty reference)")
@@ -244,7 +256,7 @@ def resolve_title(
     provider = require(match.provider)
     title = provider.details(match.url or match.id)
     title.provider = title.provider or match.provider
-    title.slug = title.slug or slugify(title.title)
+    title.slug = title.url_slug
     title.raw["match"] = {"query": reference, "confidence": confidence}
     return title, provider
 
@@ -287,8 +299,13 @@ def load_episodes(title: Title, provider: MediaProvider, *, force: bool = False)
     return list(title.episodes)
 
 
-def pick_episode(title: Title, episode: float | None = None, *, latest: bool = False) -> Episode:
+def pick_episode(title: Title, episode: float | None = None, *, latest: bool = False,
+                 season: int | None = None) -> Episode:
     episodes = title.sorted_episodes()
+    if season is not None:
+        # episode numbers restart every season, so narrow down first
+        in_season = [e for e in episodes if e.season == int(season)]
+        episodes = in_season or episodes
     if not episodes:
         raise ProviderError(f"no episodes found for {title.title!r}")
     if latest:
@@ -297,10 +314,12 @@ def pick_episode(title: Title, episode: float | None = None, *, latest: bool = F
         from .db import get_db
 
         nxt = None
-        try:
-            nxt = get_db().next_unwatched(title.key)
-        except Exception:  # noqa: BLE001
-            nxt = None
+        if len(episodes) > 1:
+            try:
+                # watched state is per season when there is more than one
+                nxt = get_db().next_unwatched(title.key, season=season)
+            except Exception:  # noqa: BLE001
+                nxt = None
         if title.kind == "movie" or len(episodes) == 1:
             return episodes[0]
         target = nxt if nxt is not None else episodes[0].number

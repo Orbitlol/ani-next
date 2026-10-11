@@ -4,6 +4,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from aninext.db import SCHEMA_VERSION, Database
 from aninext.models import Episode, HistoryEntry, Title
@@ -89,7 +90,7 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(self.db.next_unwatched(self.title.key), 1.0)
         self.db.episode_mark(self.title.key, 1, watched=True, progress=120, duration=1450)
         self.assertEqual(self.db.next_unwatched(self.title.key), 2.0)
-        self.assertEqual(self.db.episode_progress(self.title.key)[1.0]["progress"], 120)
+        self.assertEqual(self.db.episode_progress(self.title.key)[(0, 1.0)]["progress"], 120)
 
     def test_episodes_upsert_is_idempotent(self) -> None:
         self.db.library_add(self.title)
@@ -175,3 +176,59 @@ class TestDatabase(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class TestSeasonAwareProgress(unittest.TestCase):
+    """Episode numbers restart every season, so watched state is per season."""
+
+    def setUp(self) -> None:
+        self.dir = TemporaryDirectory()
+        self.db = Database(Path(self.dir.name) / "seasons.db")
+        self.title = Title(title="Severance", provider="demo", id="demo:severance")
+        self.db.library_add(self.title)
+        for season, count in ((1, 5), (2, 4)):
+            for number in range(1, count + 1):
+                self.db.episode_mark(self.title.key, number, season=season, watched=False)
+
+    def tearDown(self) -> None:
+        self.db.close()
+        self.dir.cleanup()
+
+    def test_fresh_show_starts_at_the_first_season(self) -> None:
+        self.assertEqual(self.db.next_unwatched(self.title.key), 1.0)
+
+    def test_continues_the_season_being_watched(self) -> None:
+        self.db.episode_mark(self.title.key, 1, season=1, watched=True)
+        self.assertEqual(self.db.next_unwatched(self.title.key), 2.0)
+        for number in range(1, 6):
+            self.db.episode_mark(self.title.key, number, season=1, watched=True)
+        self.assertEqual(self.db.next_unwatched(self.title.key), 1.0)        # season 2 starts
+        self.db.episode_mark(self.title.key, 1, season=2, watched=True)
+        self.assertEqual(self.db.next_unwatched(self.title.key), 2.0)        # ... and keeps going
+
+    def test_explicit_season_stays_inside_it(self) -> None:
+        for number in range(1, 6):
+            self.db.episode_mark(self.title.key, number, season=1, watched=True)
+        self.assertEqual(self.db.next_unwatched(self.title.key, season=1), 6.0)
+        self.assertEqual(self.db.next_unwatched(self.title.key, season=2), 1.0)
+
+    def test_progress_is_keyed_by_season_and_number(self) -> None:
+        self.db.episode_mark(self.title.key, 1, season=2, progress=120, duration=1440)
+        progress = self.db.episode_progress(self.title.key)
+        self.assertEqual(progress[(2, 1.0)]["progress"], 120)
+        self.assertEqual(progress[(1, 1.0)]["progress"], 0)
+        self.assertIn((1, 5.0), progress)
+
+    def test_two_seasons_do_not_overwrite_each_other(self) -> None:
+        self.db.episodes_upsert(Title(
+            title="Severance", provider="demo", id="demo:severance",
+            episodes=[Episode(number=1, season=1, title="S1 one"),
+                      Episode(number=1, season=2, title="S2 one")],
+        ))
+        rows = self.db.query(
+            "SELECT season, number, title FROM episodes WHERE key=? AND title IS NOT NULL "
+            "ORDER BY season, number",
+            (self.title.key,),
+        )
+        self.assertEqual([(r["season"], r["number"], r["title"]) for r in rows],
+                         [(1, 1.0, "S1 one"), (2, 1.0, "S2 one")])

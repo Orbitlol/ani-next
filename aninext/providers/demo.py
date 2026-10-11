@@ -70,12 +70,18 @@ CATALOG: list[dict[str, Any]] = [
         "poster": "/img/severance.jpg",
         "banner": "",
         "synopsis": "Office workers whose memories are surgically split between work and home life.",
+        # 4-tuples are (season, title, duration, aired) - two seasons here so the
+        # season picker in `aninext severance` has something to show offline
         "episodes": [
-            ("Good News About Hell", "57m", "2022-02-18"),
-            ("Half Loop", "53m", "2022-02-18"),
-            ("In Perpetuity", "56m", "2022-02-25"),
-            ("The You You Are", "48m", "2022-03-04"),
-            ("The Grim Barbarity of Optics and Design", "46m", "2022-03-11"),
+            (1, "Good News About Hell", "57m", "2022-02-18"),
+            (1, "Half Loop", "53m", "2022-02-18"),
+            (1, "In Perpetuity", "56m", "2022-02-25"),
+            (1, "The You You Are", "48m", "2022-03-04"),
+            (1, "The Grim Barbarity of Optics and Design", "46m", "2022-03-11"),
+            (2, "Hello, Ms. Cobel", "56m", "2025-01-17"),
+            (2, "Goodbye, Mrs. Selvig", "50m", "2025-01-17"),
+            (2, "Who Is Alive?", "52m", "2025-01-24"),
+            (2, "Woe's Hollow", "49m", "2025-01-31"),
         ],
     },
     {
@@ -100,6 +106,36 @@ _STREAMS = {
     "backup": "https://backup.demo-aninext.test/vod/{slug}-{ep}-1080p.mp4",
     "low": "https://backup.demo-aninext.test/vod/{slug}-{ep}-480p.mp4",
 }
+
+
+def _episode_slug(item: dict[str, Any], season: int, number: int) -> str:
+    """`severance-s2e1` for multi-season titles, `frieren-3` otherwise."""
+    if season > 0 and len(season_numbers(item)) > 1:
+        return f"s{season}e{number}"
+    return str(number)
+
+
+def episode_rows(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """Episode entries as dicts, accepting both 3- and 4-tuples.
+
+    A 4-tuple is (season, title, duration, aired); 3-tuples belong to season 1
+    when the title has several seasons, and to "no season" otherwise.
+    """
+    raw = item.get("episodes") or []
+    multi = any(len(row) == 4 for row in raw)
+    rows: list[dict[str, Any]] = []
+    for row in raw:
+        if len(row) == 4:
+            season, name, duration, aired = row
+        else:
+            name, duration, aired = row
+            season = 1 if multi else 0
+        rows.append({"season": int(season), "title": name, "duration": duration, "aired": aired})
+    return rows
+
+
+def season_numbers(item: dict[str, Any]) -> list[int]:
+    return sorted({row["season"] for row in episode_rows(item) if row["season"] > 0})
 
 
 def _find(slug_or_query: str) -> dict[str, Any] | None:
@@ -166,21 +202,33 @@ def _search_page(query: str, page: int) -> str:
 
 
 def _detail_page(item: dict[str, Any], page: int) -> str:
-    episodes = item["episodes"]
+    episodes = episode_rows(item)
     start = (page - 1) * EPS_PER_PAGE
     chunk = list(enumerate(episodes, start=1))[start:start + EPS_PER_PAGE]
 
+    # episode numbers restart in every season, exactly like a real site
+    counters: dict[int, int] = {}
+    numbers: list[int] = []
+    for row in episodes:
+        counters[row["season"]] = counters.get(row["season"], 0) + 1
+        numbers.append(counters[row["season"]])
+
     rows = []
-    for number, (title, duration, aired) in chunk:
+    current_season = None
+    for index, (number, row) in enumerate(chunk):
+        season = row["season"]
+        if season and season != current_season and start == 0:
+            current_season = season
+            rows.append(f'\n      <h3 class="season-head" data-season="{season}">Season {season}</h3>')
         rows.append(
             f"""
-      <li class="episode" data-number="{number}" data-audio="sub dub">
-        <a href="/watch/{item['slug']}-{number}">
+      <li class="episode" data-number="{numbers[start + index]}" data-season="{season}" data-audio="sub dub">
+        <a href="/watch/{item['slug']}-{_episode_slug(item, season, numbers[start + index])}">
           <span class="ep-num">{number}</span>
-          <span class="ep-title">{title}</span>
+          <span class="ep-title">{row['title']}</span>
         </a>
-        <span class="duration">{duration}</span>
-        <span class="aired" data-date="{aired}">{aired}</span>
+        <span class="duration">{row['duration']}</span>
+        <span class="aired" data-date="{row['aired']}">{row['aired']}</span>
       </li>"""
         )
     next_link = ""
@@ -222,8 +270,11 @@ def _detail_page(item: dict[str, Any], page: int) -> str:
 </body></html>"""
 
 
-def _episode_page(item: dict[str, Any], number: int) -> str:
+def _episode_page(item: dict[str, Any], number: int, season: int = 0) -> str:
     slug = item["slug"]
+    if not season:
+        season = 1 if len(season_numbers(item)) > 1 else 0
+    label = f"Season {season} " if season else ""
     servers = [
         ("HLS Server", f"/embed/hls?slug={slug}&ep={number}"),
         ("Backup 1080p", f"/embed/mp4?slug={slug}&ep={number}&q=1080p"),
@@ -253,7 +304,7 @@ def _episode_page(item: dict[str, Any], number: int) -> str:
 <html><head><title>Watch {item['title']} episode {number}</title></head>
 <body>
   <div class="watch-page">
-    <h1 class="entry-title">{item['title']} - Episode {number}</h1>
+    <h1 class="entry-title">{item['title']} - {label}Episode {number}</h1>
     <div class="servers" id="servers">{server_html}</div>
     <div class="downloads" id="downloads">{downloads}</div>
     <div class="subtitles">{subtitle_html}</div>
@@ -349,13 +400,13 @@ class _LocalClient(Client):
             html = _detail_page(item, int(params.get("page", 1) or 1))
         elif path.startswith("/watch/"):
             raw = path.split("/watch/", 1)[1]
-            m = re.match(r"(?P<slug>.+?)-(?P<num>\d+)$", raw)
+            m = re.match(r"(?P<slug>.+?)-(?:s(?P<season>\d+)e)?(?P<num>\d+)$", raw)
             if not m:
                 return Response(url=url, status=404, headers={}, body=b"bad episode url")
             item = _find(m.group("slug"))
             if item is None:
                 return Response(url=url, status=404, headers={}, body=b"not found")
-            html = _episode_page(item, int(m.group("num")))
+            html = _episode_page(item, int(m.group("num")), int(m.group("season") or 0))
         elif path.startswith("/embed/"):
             kind = "mp4" if path.startswith("/embed/mp4") else "hls"
             html = _embed_page(kind, params.get("slug", "frieren"), int(params.get("ep", 1) or 1),
@@ -428,6 +479,7 @@ RULE: dict[str, Any] = {
             "next": "div.eplister div.pagination a.next-page",
             "fields": {
                 "number": "@data-number | span.ep-num ::text",
+                "season": "@data-season",
                 "title": "span.ep-title ::text",
                 "url": "a @href",
                 "duration": "span.duration ::text",

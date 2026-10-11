@@ -99,7 +99,7 @@ def streams(
     _boot()
     title, provider = aggregate.resolve_title(reference, providers=providers, kind=kind)
     aggregate.load_episodes(title, provider)
-    target = aggregate.pick_episode(title, episode, latest=latest)
+    target = aggregate.pick_episode(title, episode, latest=latest, season=season)
     found = aggregate.get_streams(title, target, provider, allow_fallback=fallback)
     if quality:
         ordered = sorted(found, key=lambda s: (s.quality == quality, s.rank, s.playable), reverse=True)
@@ -108,20 +108,22 @@ def streams(
 
 
 def downloads(reference: str, *, episode: float | None = None,
+              season: int | None = None,
               providers: Sequence[str] | None = None) -> list[DownloadLink]:
     _boot()
     title, provider = aggregate.resolve_title(reference, providers=providers)
     aggregate.load_episodes(title, provider)
-    target = aggregate.pick_episode(title, episode)
+    target = aggregate.pick_episode(title, episode, season=season)
     return aggregate.get_downloads(title, target, provider)
 
 
 def subtitles(reference: str, *, episode: float | None = None,
+              season: int | None = None,
               providers: Sequence[str] | None = None) -> list[Subtitle]:
     _boot()
     title, provider = aggregate.resolve_title(reference, providers=providers)
     aggregate.load_episodes(title, provider)
-    target = aggregate.pick_episode(title, episode)
+    target = aggregate.pick_episode(title, episode, season=season)
     return aggregate.get_subtitles(title, target, provider)
 
 
@@ -138,6 +140,7 @@ def download(
     *,
     episode: float | None = None,
     episodes: str | Iterable[float] | None = None,
+    season: int | None = None,
     quality: str | None = None,
     directory: str | Path | None = None,
     jobs: int | None = None,
@@ -152,7 +155,7 @@ def download(
     aggregate.load_episodes(title, provider)
 
     if episodes is None or episodes == "":
-        numbers = [aggregate.pick_episode(title, episode).number]
+        numbers = [aggregate.pick_episode(title, episode, season=season).number]
     elif isinstance(episodes, str):
         numbers = _expand_spec(episodes, title)
     else:

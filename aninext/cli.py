@@ -10,15 +10,26 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from . import __version__, aggregate, log, termux
+from . import __version__, aggregate, log, picker, termux
 from .config import download_dir, get_config
-from .models import Episode, SearchResult, Stream, Title, quality_rank
+from .models import Episode, SearchResult, Stream, Title
 from .net import HttpError
-from .providers import ProviderError, all_providers, available, get, ids as provider_ids, load_builtin, require
+from .providers import ProviderError, all_providers, get, load_builtin
 from .providers.base import SearchQuery
 
 PROG = "aninext"
 KINDS = ("anime", "movie", "series", "tv", "cartoon", "donghua", "all")
+
+# Filled in by build_parser(); used to tell `aninext frieren` (a search for
+# "frieren") apart from `aninext search frieren` (the explicit command).
+COMMANDS: set[str] = set()
+
+# global flags that take a value - the query rewriter needs to skip over them
+_VALUE_FLAGS = {"-p", "--provider", "-k", "--kind", "--home"}
+_FLAG_FLAGS = {
+    "-h", "--help", "--version", "--json", "-q", "--quiet", "-v", "--verbose",
+    "--no-colour", "--no-color",
+}
 
 
 # --------------------------------------------------------------------------
@@ -267,6 +278,328 @@ def _parse_episode_spec(spec: str, title: Title) -> list[float]:
 
 
 # --------------------------------------------------------------------------
+# the default flow: `aninext <name>`
+# --------------------------------------------------------------------------
+
+def _result_picks(results: Sequence[SearchResult]) -> list[picker.Pick]:
+    picks: list[picker.Pick] = []
+    for result in results:
+        extras = " ".join(x for x in (result.year, result.kind, result.status) if x)
+        label = f"{result.title[:58]:<58} {extras:<28} {result.provider}"
+        preview = "\n".join(
+            line for line in (
+                result.title,
+                f"{result.year}  {result.kind}  {result.score}" if result.year or result.score else "",
+                "",
+                result.synopsis[:600],
+            ) if line is not None
+        )
+        picks.append(
+            picker.Pick(
+                key=f"{result.provider}:{result.url or result.id}",
+                label=label,
+                preview=preview,
+                search=f"{result.year} {result.provider} {result.kind}",
+                data=result,
+            )
+        )
+    return picks
+
+
+def _season_choices(title: Title) -> list[dict[str, Any]]:
+    """Seasons the provider knows about, without the extras/specials."""
+    if title.seasons:
+        out = []
+        for season in title.seasons:
+            number = int(season.get("season") or 0)
+            if number <= 0:
+                continue
+            out.append({
+                "season": number,
+                "name": str(season.get("name") or f"Season {number}"),
+                "episodes": int(season.get("episodes") or 0),
+                "year": str(season.get("year") or ""),
+            })
+        if len(out) > 1:
+            return out
+    numbers = sorted({e.season for e in title.episodes if e.season and e.season > 0})
+    if len(numbers) > 1:
+        return [
+            {
+                "season": number,
+                "name": f"Season {number}",
+                "episodes": sum(1 for e in title.episodes if e.season == number),
+                "year": "",
+            }
+            for number in numbers
+        ]
+    return []
+
+
+def _episode_picks(title: Title, episodes: Sequence[Episode], *,
+                   season: int | None = None) -> list[picker.Pick]:
+    """Episode rows, newest first, with watched / next-up markers."""
+    progress: dict[tuple[int, float], dict] = {}
+    next_number: float | None = None
+    try:  # the database is optional - a broken one must not stop playback
+        from .db import get_db
+
+        db = get_db()
+        progress = db.episode_progress(title.key)
+        next_number = db.next_unwatched(title.key, season=season)
+    except Exception:  # noqa: BLE001
+        next_number = None
+
+    picks: list[picker.Pick] = []
+    for episode in reversed(list(episodes)):    # newest first, like a streaming app
+        watched = bool((progress.get((episode.season, episode.number)) or {}).get("watched"))
+        if watched:
+            second, hint = "\u2714", "watched"
+        elif next_number is not None and abs(episode.number - float(next_number)) < 1e-6:
+            second, hint = "\u25b8", "next up"
+        else:
+            second, hint = " ", ""
+        marker = f"{second} {hint}".rstrip()
+        # a little air between the first and second marker keeps them readable
+        padded = marker + (" " * max(0, 9 - len(marker)))
+        label = (
+            f"E{episode.number:02g}".ljust(5)
+            + f"{episode.title[:52]:<52} {padded} {episode.duration or ''}".rstrip()
+        )
+        if episode.season > 0 and season is None:   # the list mixes seasons
+            label = (
+                f"S{episode.season}".ljust(5)
+                + f"E{episode.number:02g}".ljust(5)
+                + f"{episode.title[:50]:<50} {padded} {episode.duration or ''}".rstrip()
+            )
+        preview = "\n".join(
+            line for line in (
+                episode.label,
+                f"aired {episode.aired}" if episode.aired else "",
+                ", ".join(episode.audio) if episode.audio else "",
+                "",
+                episode.synopsis[:600],
+            ) if line
+        )
+        picks.append(
+            picker.Pick(
+                key=f"{episode.number:g}",
+                label=label,
+                preview=preview or episode.label,
+                search=f"episode {episode.number:g} season {episode.season}",
+                data=episode,
+            )
+        )
+    return picks
+
+
+def _render_links(title: Title, episode: Episode, provider: Any, *, json_out: bool = False,
+                  streams: Sequence[Stream] | None = None) -> int:
+    """The body of `aninext links`, reused by the interactive flow."""
+    streams = list(streams) if streams is not None else aggregate.get_streams(title, episode, provider)
+    downloads = aggregate.get_downloads(title, episode, provider)
+    subs = aggregate.get_subtitles(title, episode, provider)
+    if json_out:
+        _json({
+            "title": title.to_dict(with_episodes=False),
+            "episode": episode.to_dict(),
+            "streams": [s.to_dict() for s in streams],
+            "downloads": [d.to_dict() for d in downloads],
+            "subtitles": [s.to_dict() for s in subs],
+        })
+        return 0
+    _head(f"{title.title} - {episode.label}")
+    _out()
+    _head("  Streams")
+    rows = [[s.quality or "-", s.kind, (s.server or "")[:26],
+             "yes" if s.playable else "no", s.url[:76]] for s in streams]
+    _out(_table(rows, ["quality", "kind", "server", "direct", "url"]))
+    if downloads:
+        _out()
+        _head("  Downloads")
+        rows = []
+        for d in downloads:
+            size = f"{d.size / (1024 * 1024):.0f}MB" if d.size else "-"
+            rows.append([d.quality or "-", size, (d.server or "")[:20], d.url[:80]])
+        _out(_table(rows, ["quality", "size", "server", "url"]))
+    if subs:
+        _out()
+        _head("  Subtitles")
+        for s in subs:
+            _out(f"    {s.label:<18} {s.lang:<6} {s.url[:80]}")
+    return 0
+
+
+def _play_episode(title: Title, episode: Episode, provider: Any, args, cfg) -> int:
+    """Resolve, pick a stream and hand the episode to the player."""
+    from . import player as player_mod
+
+    streams = aggregate.get_streams(title, episode, provider)
+    if not streams:
+        raise ProviderError(f"no streams for {title.title} {episode.label}")
+    stream = _pick_stream(streams, getattr(args, "quality", None) or None,
+                          prefer=getattr(args, "server", "") or "")
+    if stream is None:
+        raise ProviderError("no stream selected")
+    if getattr(args, "print_url", False):
+        _out(stream.url)
+        return 0
+    subs = aggregate.get_subtitles(title, episode, provider)
+    played = player_mod.play_episode(
+        title,
+        episode,
+        stream,
+        player=getattr(args, "player", None) or cfg.get("open_player", "auto"),
+        playlist=getattr(args, "playlist", False),
+        open_with=getattr(args, "open", False),
+        record=cfg.get_bool("history", True),
+        subtitles=subs,
+        mark_watched=True,
+    )
+    if played and not getattr(args, "no_next", False):
+        _hint_next(title, episode)
+    return 0 if played else 1
+
+
+def _hint_next(title: Title, episode: Episode) -> None:
+    """One friendly line about what comes after the episode just played."""
+    nxt = _next_episode(title, episode)
+    if nxt is None:
+        log.ok("that was the last episode of %s", title.title)
+        return
+    log.info("up next: %s", nxt.label)
+    log.info("keep watching with `%s watch %s`", PROG, title.key)
+
+
+def cmd_quick(args, cfg) -> int:
+    """`aninext <name>` - search, pick, pick a season, pick an episode, play."""
+    query = " ".join(args.query).strip()
+    if not query:
+        log.error("what should I look for?  try: aninext frieren")
+        return 2
+
+    providers = args.provider or None
+    kind = None if args.kind in (None, "all") else args.kind
+    limit = args.limit or cfg.get_int("search_limit", 24)
+
+    title: Title | None = None
+    provider = None
+    results: list[SearchResult] = []
+    if not _looks_like_reference(query):
+        log.info("searching %s for %r", PROG, query)
+        results = aggregate.search(query, limit=limit, kind=kind,
+                                   providers=providers, sort=args.sort)
+        _save_last_results(results)
+
+        if not results:
+            if args.json:
+                _json([])
+                return 1
+            log.warn("no results for %r", query)
+            return 1
+
+        if args.json or not picker.interactive():
+            if args.json:
+                _json([r.to_dict() for r in results])
+            else:
+                render_results(results)
+                _out()
+                _out(log.colour(
+                    "  tip: `aninext play <number>` or install fzf (`pkg install fzf`) "
+                    "for arrow-key picking",
+                    "grey",
+                ))
+            return 0
+
+        if len(results) == 1:
+            chosen = results[0]
+            log.info("found %s", chosen.title)
+        else:
+            _head(f"{len(results)} results for {query!r}")
+            picked = picker.pick_one(_result_picks(results), prompt="title",
+                                     header=f"{len(results)} results · {picker.FZF_HINT}")
+            if picked is None:
+                _out("cancelled")
+                return 0
+            chosen = picked.data
+        title, provider = aggregate.resolve_title(
+            f"{chosen.provider}:{chosen.url or chosen.id}", providers=[chosen.provider], kind=kind
+        )
+    else:
+        # `aninext demo:severance` or a site url: no searching needed
+        title, provider = aggregate.resolve_title(query, providers=providers, kind=kind)
+
+    log.info("loaded %s", title.title)
+    aggregate.load_episodes(title, provider)
+    return _quick_one_title(title, provider, args, cfg)
+
+
+def _looks_like_reference(query: str) -> bool:
+    """`demo:severance`, `tmdb:94997` or a URL: already a title, not a search."""
+    if query.startswith(("http://", "https://")):
+        return True
+    head, sep, rest = query.partition(":")
+    return bool(sep and rest and head.isidentifier())
+
+
+def _quick_one_title(title: Title, provider: Any, args, cfg) -> int:
+    """Season picker, episode picker, then playback."""
+    if not picker.interactive() and args.episode is None:
+        # a pipe or a script: show the episode list instead of asking questions
+        _print_episodes(title, list(title.episodes), season=args.season)
+        return 0
+
+    season: int | None = None
+    if args.season is not None:
+        season = int(args.season)
+    elif args.episode is None and picker.interactive():
+        # `-e N` means "stop asking": with seasons around, pair it with -s
+        seasons = _season_choices(title)
+        if len(seasons) > 1:
+            picks = [
+                picker.Pick(
+                    key=str(s["season"]),
+                    label=f"Season {s['season']:<3} {s['name'][:44]:<44} "
+                          f"{(str(s['episodes']) + ' episodes') if s['episodes'] else '':<11} {s['year']}",
+                    preview=f"{title.title}\n\n{s['name']}\n"
+                            f"{s['episodes']} episode(s) {s['year']}",
+                    data=s,
+                )
+                for s in seasons
+            ]
+            picked = picker.pick_one(picks, prompt="season",
+                                     header=f"{title.title} · {len(seasons)} seasons")
+            if picked is None:
+                _out("cancelled")
+                return 0
+            season = int(picked.data["season"])
+
+    episodes = title.sorted_episodes()
+    if season is not None:
+        # season-less providers report season 0; keep their episodes in the list
+        filtered = [e for e in episodes if not e.season or e.season == season]
+        episodes = filtered or episodes
+
+    if args.episode is not None:
+        episode = aggregate.pick_episode(title, args.episode, season=season)
+    else:
+        _head(f"{title.title}" + (f" · season {season}" if season else ""))
+        picked = picker.pick_one(
+            _episode_picks(title, episodes, season=season),
+            prompt="episode",
+            header=f"{picker.FZF_HINT} · newest first",
+        )
+        if picked is None:
+            _out("cancelled")
+            return 0
+        episode = picked.data
+
+    if args.no_play:
+        return _render_links(title, episode, provider, json_out=args.json)
+    return _play_episode(title, episode, provider, args, cfg)
+
+
+# --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
 
@@ -322,24 +655,41 @@ def cmd_episodes(args, cfg) -> int:
     if args.json:
         _json([e.to_dict() for e in episodes])
         return 0
-    _head(f"{title.title} - {len(episodes)} episodes")
+    _print_episodes(title, episodes, first=getattr(args, "first", False),
+                    limit=getattr(args, "limit", 0), season=args.season)
+    return 0
+
+
+def _print_episodes(title: Title, episodes: Sequence[Episode], *, first: bool = False,
+                    limit: int = 0, season: float | None = None) -> None:
+    seasons = {ep.season for ep in episodes if ep.season > 0}
+    _head(f"{title.title} - {len(episodes)} episodes"
+          + (f" in {len(seasons)} seasons" if len(seasons) > 1 else ""))
     ordered = title.sorted_episodes()
-    if not getattr(args, "first", False):
+    if not first:
         ordered = list(reversed(ordered))
-    if getattr(args, "limit", 0):
-        ordered = ordered[: args.limit]
+    if season is not None:
+        in_season = [ep for ep in ordered if ep.season == int(season)]
+        ordered = in_season or ordered
+    if limit:
+        ordered = ordered[:limit]
     rows = []
     for ep in ordered:
         audio = ",".join(ep.audio)
-        rows.append([f"{ep.number:g}".rjust(5), ep.title[:52], ep.duration, ep.aired, audio])
-    _out(_table(rows, ["ep", "title", "len", "aired", "audio"]))
-    return 0
+        row = [f"{ep.number:g}".rjust(5), ep.title[:52], ep.duration, ep.aired, audio]
+        if len(seasons) > 1:
+            row.insert(0, f"S{ep.season}".rjust(3) if ep.season else "  -")
+        rows.append(row)
+    header = ["season", "ep", "title", "len", "aired", "audio"] if len(seasons) > 1 else \
+             ["ep", "title", "len", "aired", "audio"]
+    _out(_table(rows, header))
 
 
 def _load_streams_for(args, cfg) -> tuple[Title, Any, Episode, list[Stream]]:
     title, provider = _resolve_reference(args, args.provider or None, args.kind)
     aggregate.load_episodes(title, provider)
-    episode = aggregate.pick_episode(title, args.episode, latest=getattr(args, "latest", False))
+    episode = aggregate.pick_episode(title, args.episode, latest=getattr(args, "latest", False),
+                                     season=getattr(args, "season", None))
     streams = aggregate.get_streams(title, episode, provider, allow_fallback=not getattr(args, "no_fallback", False))
     if not streams:
         raise ProviderError(f"no playable streams for {title.title} {episode.label}")
@@ -348,40 +698,7 @@ def _load_streams_for(args, cfg) -> tuple[Title, Any, Episode, list[Stream]]:
 
 def cmd_links(args, cfg) -> int:
     title, provider, episode, streams = _load_streams_for(args, cfg)
-    downloads = aggregate.get_downloads(title, episode, provider)
-    subs = aggregate.get_subtitles(title, episode, provider)
-    if args.json:
-        _json(
-            {
-                "title": title.to_dict(with_episodes=False),
-                "episode": episode.to_dict(),
-                "streams": [s.to_dict() for s in streams],
-                "downloads": [d.to_dict() for d in downloads],
-                "subtitles": [s.to_dict() for s in subs],
-            }
-        )
-        return 0
-    _head(f"{title.title} - {episode.label}")
-    _out()
-    _head("  Streams")
-    rows = []
-    for s in streams:
-        rows.append([s.quality or "-", s.kind, (s.server or "")[:26], "yes" if s.playable else "no", s.url[:76]])
-    _out(_table(rows, ["quality", "kind", "server", "direct", "url"]))
-    if downloads:
-        _out()
-        _head("  Downloads")
-        rows = []
-        for d in downloads:
-            size = f"{d.size / (1024*1024):.0f}MB" if d.size else "-"
-            rows.append([d.quality or "-", size, (d.server or "")[:20], d.url[:80]])
-        _out(_table(rows, ["quality", "size", "server", "url"]))
-    if subs:
-        _out()
-        _head("  Subtitles")
-        for s in subs:
-            _out(f"    {s.label:<18} {s.lang:<6} {s.url[:80]}")
-    return 0
+    return _render_links(title, episode, provider, json_out=args.json, streams=streams)
 
 
 def cmd_play(args, cfg) -> int:
@@ -409,17 +726,16 @@ def cmd_play(args, cfg) -> int:
         open_with=args.open,
         record=cfg.get_bool("history", True) and not args.no_history,
     )
-    if played and cfg.get_bool("auto_next", False) and not args.no_next:
-        nxt = _next_episode(title, episode)
-        if nxt is not None:
-            log.info("up next: %s", nxt.label)
+    if played and not args.no_next:
+        _hint_next(title, episode)
     return 0 if played else 1
 
 
 def _next_episode(title: Title, episode: Episode) -> Episode | None:
+    """The following episode, crossing into the next season when there is one."""
     episodes = title.sorted_episodes()
     for index, ep in enumerate(episodes):
-        if abs(ep.number - episode.number) < 1e-6:
+        if (ep.season, ep.number) == (episode.season, episode.number):
             return episodes[index + 1] if index + 1 < len(episodes) else None
     return None
 
@@ -428,7 +744,8 @@ def cmd_watch(args, cfg) -> int:
     """Continue a show: pick the next unwatched episode and play it."""
     title, provider = _resolve_reference(args, args.provider or None, args.kind)
     aggregate.load_episodes(title, provider)
-    episode = aggregate.pick_episode(title, args.episode, latest=args.latest)
+    episode = aggregate.pick_episode(title, args.episode, latest=args.latest,
+                                     season=getattr(args, "season", None))
     args.episode = episode.number
     streams = aggregate.get_streams(title, episode, provider)
     if not streams:
@@ -462,7 +779,8 @@ def cmd_download(args, cfg) -> int:
     elif args.latest:
         numbers = [title.sorted_episodes()[-1].number]
     else:
-        numbers = [aggregate.pick_episode(title, args.episode).number]
+        numbers = [aggregate.pick_episode(title, args.episode,
+                                          season=getattr(args, "season", None)).number]
 
     wanted = set(numbers)
     episodes = [e for e in title.sorted_episodes() if e.number in wanted]
@@ -706,7 +1024,7 @@ def cmd_season(args, cfg) -> int:
 
 
 def cmd_resolve(args, cfg) -> int:
-    from .resolve import Resolver, upgrade_embeds
+    from .resolve import Resolver
 
     patterns: list[str] = []
     if args.pattern:
@@ -872,10 +1190,17 @@ def cmd_doctor(args, cfg) -> int:
             _kv([(label, f"{path} ({'ok' if writable else 'read-only'})")])
         except OSError as exc:
             _kv([(label, f"{path} (error: {exc})")])
+    hints = []
+    if not tools.get("fzf"):
+        hints.append("pkg install fzf            (arrow-key picking in `aninext <name>`)")
     if not tools.get("ffmpeg"):
+        hints.append("pkg install ffmpeg aria2 yt-dlp termux-api")
+    if not tools.get("mpv") and not tools.get("mpv-android app"):
+        hints.append("install the mpv-android app (or `pkg install mpv`) to watch")
+    if hints:
         _out()
-        _out(log.colour("  hint: pkg install ffmpeg aria2 yt-dlp termux-api", "yellow"))
-        _out(log.colour("  (ffmpeg enables HLS muxing, aria2c speeds up downloads)", "grey"))
+        for hint in hints:
+            _out(log.colour(f"  hint: {hint}", "yellow"))
     return 0
 
 
@@ -952,6 +1277,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_parser(*a, **kw):
         kw.setdefault("parents", [common])
+        if a and isinstance(a[0], str):
+            COMMANDS.add(a[0])
         return _add(*a, **kw)
 
     sub.add_parser = add_parser  # type: ignore[assignment]
@@ -974,8 +1301,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-episodes", action="store_true")
     p.set_defaults(func=cmd_info)
 
+    p = sub.add_parser("quick", help="search, pick and play (what `aninext <name>` does)")
+    p.add_argument("query", nargs="+", help="what to look for")
+    p.add_argument("-e", "--episode", type=float, help="skip the pickers and play this episode")
+    p.add_argument("-s", "--season", type=float, default=None, help="season number")
+    p.add_argument("-Q", "--quality")
+    p.add_argument("--server")
+    p.add_argument("--player", help="auto | mpv-android | mpv | vlc | vlc-android | intent")
+    p.add_argument("--no-play", action="store_true", help="pick an episode, then print its links")
+    p.add_argument("--no-next", action="store_true")
+    p.add_argument("-n", "--limit", type=int, default=0)
+    p.add_argument("--sort", default=None)
+    p.set_defaults(func=cmd_quick)
+
     p = sub.add_parser("episodes", help="list episodes")
     p.add_argument("reference")
+    p.add_argument("-s", "--season", type=float, default=None, help="season number")
     p.add_argument("-n", "--limit", type=int, default=0, help="show only the first N (0 = all)")
     p.add_argument("--first", action="store_true", help="oldest first")
     p.set_defaults(func=cmd_episodes)
@@ -983,6 +1324,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("links", help="show streams, downloads and subtitles")
     p.add_argument("reference")
     p.add_argument("-e", "--episode", type=float)
+    p.add_argument("-s", "--season", type=float, default=None, help="season number")
     p.add_argument("--latest", action="store_true")
     p.add_argument("--no-fallback", action="store_true")
     p.set_defaults(func=cmd_links)
@@ -990,6 +1332,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("play", help="resolve and play an episode")
     p.add_argument("reference")
     p.add_argument("-e", "--episode", type=float)
+    p.add_argument("-s", "--season", type=float, default=None, help="season number")
     p.add_argument("--latest", action="store_true")
     p.add_argument("-Q", "--quality")
     p.add_argument("--server")
@@ -1005,6 +1348,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("watch", help="continue a show (next unwatched episode)")
     p.add_argument("reference")
     p.add_argument("-e", "--episode", type=float)
+    p.add_argument("-s", "--season", type=float, default=None, help="season number")
     p.add_argument("--latest", action="store_true")
     p.add_argument("-Q", "--quality")
     p.add_argument("--player")
@@ -1016,6 +1360,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("download", help="download episodes")
     p.add_argument("reference")
     p.add_argument("-e", "--episode", type=float)
+    p.add_argument("-s", "--season", type=float, default=None, help="season number")
     p.add_argument("-E", "--episodes", help="1-5,8 / all")
     p.add_argument("--all", action="store_true")
     p.add_argument("--latest", action="store_true")
@@ -1118,8 +1463,6 @@ def build_parser() -> argparse.ArgumentParser:
 def apply_globals(args) -> None:
     if getattr(args, "home", None):
         os.environ["ANINEXT_HOME"] = os.path.expanduser(args.home)
-    from . import termux as _termux
-
     if getattr(args, "verbose", False):
         log.set_level("debug")
     elif getattr(args, "quiet", False):
@@ -1131,12 +1474,89 @@ def apply_globals(args) -> None:
         os.environ.setdefault("ANINEXT_NO_WAKE", "1")
 
 
+def _rewrite_argv(argv: list[str]) -> list[str]:
+    """`aninext frieren` -> `aninext quick frieren`.
+
+    Only the *first* bare word is treated as a query, and only when it is not
+    a command name, so `aninext search frieren`, `aninext -p demo frieren` and
+    `aninext frieren -e 2` all do the obvious thing.
+    """
+    if not COMMANDS:          # e.g. when called directly, before build_parser()
+        build_parser()
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":                      # end of flags: the next word is the query
+            index += 1
+            continue
+        if not token.startswith("-"):
+            if token in COMMANDS:
+                return argv
+            return argv[:index] + ["quick"] + argv[index:]
+        if token in ("-h", "--help", "--version"):
+            return argv
+        # a flag: global value flags eat the next token, everything else is boolean
+        if "=" in token:
+            index += 1
+        elif token in _VALUE_FLAGS:
+            index += 2
+        else:
+            index += 1
+    return argv
+
+
+def _home_menu(cfg) -> int:
+    """`aninext` with no arguments: continue watching, or just show the help."""
+    try:
+        from .db import get_db
+
+        rows = get_db().continue_watching(limit=12)
+    except Exception:  # noqa: BLE001
+        rows = []
+
+    if not rows or not picker.interactive():
+        _head(f"{PROG} - what do you want to watch?")
+        _out()
+        _out(f"  {log.colour('aninext frieren', 'bold')}        search and play (no subcommand needed)")
+        _out(f"  {PROG} search <name>          search only")
+        _out(f"  {PROG} watch <name>           continue a show")
+        _out(f"  {PROG} download <name>        download episodes")
+        _out(f"  {PROG} doctor                check your setup")
+        _out()
+        _out(f"  run `{PROG} --help` for all {len(COMMANDS)} commands")
+        return 0
+
+    _head("continue watching")
+    picks = [
+        picker.Pick(
+            key=str(row.get("title_key") or row.get("title")),
+            label=f"{str(row['title'])[:46]:<46} "
+                  f"ep {float(row['episode']):g} → {row.get('next_episode') or '-'} "
+                  f"{row.get('kind') or ''}",
+            preview=f"{row['title']}\n\nlast watched episode {float(row['episode']):g}\n"
+                    f"{row.get('watched_eps') or 0}/{row.get('total_eps') or 0} watched",
+            data=row,
+        )
+        for row in rows
+    ]
+    picked = picker.pick_one(picks, prompt="continue", header="enter to resume")
+    if picked is None:
+        _out("nothing picked - try `aninext <name>`")
+        return 0
+    return main(["quick", str(picked.data["title"])])
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(_rewrite_argv(raw))
     if not getattr(args, "command", None):
-        parser.print_help()
-        return 0
+        apply_globals(args)
+        from .paths import ensure_dirs
+
+        ensure_dirs()
+        load_builtin()
+        return _home_menu(get_config())
 
     apply_globals(args)
     from .paths import ensure_dirs

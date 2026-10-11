@@ -692,8 +692,8 @@ class RuleProvider(MediaProvider):
             more = self._parse_episodes(doc, cfg, base_url, start_index=len(episodes))
             if not more:
                 break
-            have = {e.number for e in episodes}
-            fresh = [e for e in more if e.number not in have]
+            have = {(e.season, e.number) for e in episodes}
+            fresh = [e for e in more if (e.season, e.number) not in have]
             if not fresh:
                 break
             episodes.extend(fresh)
@@ -705,7 +705,7 @@ class RuleProvider(MediaProvider):
         fields = cfg.get("fields") or {}
         post = cfg.get("post") or {}
         episodes: list[Episode] = []
-        seen: set[float] = set()
+        seen: set[tuple[int, float]] = set()
         nodes = select(doc, cfg["items"])
         index = start_index
         for node in nodes:
@@ -719,13 +719,16 @@ class RuleProvider(MediaProvider):
                 return evaluate(node, expr, base_url=base_url, transforms=transforms, multi=multi)
 
             url = val("url")
+            season_raw = val("season")
+            season = int(parse_episode_number(str(season_raw), default=0) or 0)
             raw_number = val("number")
             number = parse_episode_number(str(raw_number), default=float(index))
             if not raw_number:
                 number = parse_episode_number(url, default=float(index))
-            if number in seen:
+            # episode numbers restart every season, so de-duplicate on (season, number)
+            if (season, number) in seen:
                 number = float(index)
-            seen.add(number)
+            seen.add((season, number))
 
             audio_raw = val("audio", multi=True)
             audio: list[str] = []
@@ -742,6 +745,7 @@ class RuleProvider(MediaProvider):
                 duration=val("duration"),
                 synopsis=val("synopsis"),
                 aired=val("aired"),
+                season=season,
                 filler="filler" in (str(val("type")) + str(val("title"))).lower(),
                 recap="recap" in str(val("title")).lower(),
                 audio=audio,

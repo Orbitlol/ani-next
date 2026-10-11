@@ -615,6 +615,7 @@ def prepare_item(title: Title, episode: Episode, stream: Stream, *, quality: str
     dl_id = db.download_add(
         title_key=title.key,
         title=title.title,
+        season=episode.season,
         episode=episode.number,
         quality=quality or stream.quality,
         url=stream.url,
