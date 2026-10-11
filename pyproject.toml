@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aninext"
+version = "1.0.0"
+description = "Zero-dependency anime / movie / series scraper and media kit for Termux"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "ani-next" }]
+keywords = ["anime", "movies", "scraper", "termux", "cli", "hls", "download"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Android",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: Multimedia :: Video",
+]
+# no runtime dependencies on purpose: stdlib only (see README "Why no pip")
+dependencies = []
+
+[project.optional-dependencies]
+# these are *programs*, not python packages - install.sh --with-extras handles them
+extras = []
+
+[project.scripts]
+aninext = "aninext.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Orbitlol/ani-next"
+Source = "https://github.com/Orbitlol/ani-next"
+
+[tool.setuptools]
+packages = ["aninext", "aninext.providers"]
+
+[tool.setuptools.package-data]
+aninext = ["sources.d/*.json", "sources.d/*.md"]

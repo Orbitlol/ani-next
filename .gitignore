@@ -1,0 +1,32 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.venv/
+venv/
+
+# tests / tooling
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# aninext runtime data (never commit a library or a cache)
+.aninext/
+*.db
+*.db-journal
+*.db-wal
+last-search.json
+downloads/
+.cache/
+logs/
+
+# editors / os
+.DS_Store
+*.swp
+.idea/
+.vscode/
