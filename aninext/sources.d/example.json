@@ -1,0 +1,132 @@
+{
+  "_readme": [
+    "aninext scraper rule - copy this file to ~/.aninext/sources/<site>.json and edit it.",
+    "A rule maps a site's HTML (or JSON) onto aninext's model. No code needed.",
+    "",
+    "selector syntax:  'div.card a'  -> text      'a @href' -> attribute",
+    "                  'span ::text' -> text      'sel html' -> inner html",
+    "                  'a @href | b @href' -> first non-empty fallback",
+    "                  CSS supports .class #id [attr=value] 'a > b' 'a + b'",
+    "                  :first-child :nth-child(2) :not(.x) :has(sel) :contains(\"txt\")",
+    "",
+    "post-processing steps (the 'post' map) accept:",
+    "  url text trim lower upper title number int float size quality",
+    "  regex:<pattern>:<group>  replace:<a>=><b>  split:<sep>  prefix:<x> suffix:<x> date",
+    "",
+    "URL fields (url, poster, embed, ...) are made absolute automatically.",
+    "This example is disabled by default; flip 'enabled' to true after editing."
+  ],
+  "id": "example",
+  "name": "Example Site",
+  "base": "https://example.com",
+  "kinds": ["anime", "movie", "series"],
+  "enabled": false,
+  "priority": 40,
+  "type": "html",
+  "headers": {
+    "Referer": "https://example.com/"
+  },
+  "search": {
+    "url": "/search?q={query}&page={page}",
+    "items": "div.anime-list article.card",
+    "max_pages": 3,
+    "next": "nav.pagination a.next @href",
+    "fields": {
+      "title": "h3.title a ::text",
+      "url": "h3.title a @href",
+      "poster": "a.poster img @data-src | a.poster img @src",
+      "year": "span.year ::text",
+      "kind": "span.type ::text",
+      "score": "span.score ::text",
+      "status": "span.status ::text",
+      "episodes": "span.eps-count ::text",
+      "synopsis": "p.synopsis ::text"
+    },
+    "post": {
+      "episodes": ["regex:(\\d+)"],
+      "title": ["trim"]
+    }
+  },
+  "details": {
+    "url": "/anime/{id}",
+    "fields": {
+      "title": "h1.entry-title ::text",
+      "alt_title": "h2.alternative ::text",
+      "poster": "div.poster img @src",
+      "banner": "div.banner img @src",
+      "synopsis": "div.description ::text",
+      "score": "span.score ::text",
+      "year": "span.year ::text",
+      "type": "span.type ::text",
+      "status": "span.status ::text",
+      "studios": "span.studio ::text",
+      "genres": "div.genres a ::text",
+      "total_episodes": "span.total-eps ::text",
+      "duration": "span.duration ::text",
+      "country": "span.country ::text"
+    },
+    "episodes": {
+      "items": "ol.episodes li.episode",
+      "max_pages": 10,
+      "next": "div.pagination a.next-page @href",
+      "fields": {
+        "number": "@data-number | span.ep-num ::text",
+        "title": "span.ep-title ::text",
+        "url": "a @href",
+        "thumbnail": "img @src",
+        "duration": "span.duration ::text",
+        "aired": "span.aired ::text",
+        "audio": "@data-audio"
+      },
+      "post": {
+        "aired": ["date"]
+      }
+    },
+    "related": {
+      "items": "div.related li",
+      "fields": {
+        "title": "a ::text",
+        "url": "a @href",
+        "type": "span.rel-type ::text"
+      }
+    }
+  },
+  "episode": {
+    "servers": {
+      "items": "div.servers div.server-item",
+      "fields": {
+        "label": "a ::text",
+        "embed": "a @data-embed | a @data-src | a @href"
+      }
+    },
+    "downloads": {
+      "items": "div.downloads a",
+      "fields": {
+        "url": "@href",
+        "label": "::text",
+        "quality": "@data-quality | ::text",
+        "size": "@data-size"
+      },
+      "post": {
+        "quality": ["quality"],
+        "size": ["size"]
+      }
+    },
+    "subtitles": {
+      "items": "div.subtitles track",
+      "fields": {
+        "label": "@label",
+        "url": "@src",
+        "lang": "@srclang"
+      }
+    },
+    "resolve": {
+      "enabled": true,
+      "patterns": [
+        "file\\s*:\\s*[\"']([^\"']+\\.m3u8[^\"']*)",
+        "\"hls\"\\s*:\\s*\"([^\"]+)\"",
+        "data-video-src=[\"']([^\"']+)[\"']"
+      ]
+    }
+  }
+}
