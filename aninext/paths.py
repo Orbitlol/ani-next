@@ -129,15 +129,22 @@ def which(*names: str) -> str | None:
 
 
 def tool_report() -> dict[str, str | None]:
-    return {
+    from . import android      # imported here to keep the module import-free of side effects
+
+    report = {
         "ffmpeg": which("ffmpeg"),
         "ffprobe": which("ffprobe"),
         "aria2c": which("aria2c"),
         "yt-dlp": which("yt-dlp", "youtube-dl"),
         "curl": which("curl"),
+        "fzf": which("fzf"),
+        "mpv": which("mpv"),
+        "vlc": which("vlc"),
         "termux-open": which("termux-open"),
         "termux-notification": which("termux-notification"),
         "termux-wake-lock": which("termux-wake-lock"),
-        "mpv": which("mpv"),
-        "vlc": which("vlc"),
+        "am (intents)": android.am_binary(),
+        "mpv-android app": android.MPV_ANDROID if android.package_installed(android.MPV_ANDROID) else None,
+        "vlc app": android.VLC_ANDROID if android.package_installed(android.VLC_ANDROID) else None,
     }
+    return report

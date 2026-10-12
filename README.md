@@ -3,15 +3,49 @@
 An anime / movie / series scraper and media kit that runs on **Termux** — and
 on any other Linux — using **nothing but the Python standard library**.
 
-Search a title, pick a stream, play it, keep a library, download episodes,
-grab subtitles, or wrap the whole engine in your own script:
+**Just type a name.** `aninext` searches, lets you pick, and plays — no
+subcommands to remember:
 
 ```console
-$ aninext -p demo search frieren
+$ aninext frieren
   1.  Frieren: Beyond Journey's End (2023)  8ep  9.0  [demo]
 
   tip: use a number to pick, e.g. `aninext info 2`
+```
 
+With [fzf](https://github.com/junegunn/fzf) installed (`pkg install fzf`) you
+get an arrow-key picker with a synopsis preview instead of typing numbers:
+
+```console
+$ aninext severance
+┌ title > ─────────────────────────────────────────────────┐
+│   1. Severance (2022)  9ep  8.7  [demo]                  │
+│   2. …                                                   │
+└──────────────────────────┬───────────────────────────────┘
+  Severance
+  Office workers whose memories are surgically split…
+
+$ aninext severance           # several seasons? you get a season picker
+  season > 1) Season 1   5 episodes  2022
+           2) Season 2   4 episodes  2025
+
+$ aninext severance           # then the episodes, newest first
+  episode > E05  The Grim Barbarity of Optics and Design   ✔ watched
+            E04  The You You Are                           ▸ next up
+            …
+```
+
+Picking an episode plays it straight away — in **mpv-android** when the app is
+installed (`am start … -p is.xyz.mpv`), otherwise `mpv`, `vlc`, an Android
+intent or `termux-open`. Playback is recorded in the history, the episode is
+marked watched, and the next one is suggested. `-e N` skips the pickers,
+`--no-play` prints the links instead, and `--json` (or piping the output) keeps
+everything non-interactive.
+
+Everything is still scriptable:
+
+```console
+$ aninext -p demo search frieren
 $ aninext info 1              # full details, episodes, related titles
 $ aninext play 1 -e 3         # resolve a stream and hand it to the player
 $ aninext download 1 -E 1-4 -Q 720p
@@ -30,6 +64,7 @@ instead of fighting it:
 | `beautifulsoup4`/`lxml`    | `aninext.htmldom`, a small CSS-lite DOM  |
 | `yt-dlp` (as a library)    | optional `yt-dlp` **binary** if present  |
 | `click`/`rich`             | `argparse` + ANSI helpers                |
+| `questionary`/`fuzzyfinder`| optional `fzf` binary, numbered prompt otherwise |
 | `sqlite`/`SQLAlchemy`      | `sqlite3` with FTS5                      |
 
 `ffmpeg`, `aria2c`, `yt-dlp` and the `termux-api` commands are detected at
@@ -43,7 +78,7 @@ git clone https://github.com/Orbitlol/ani-next
 cd ani-next
 bash install.sh               # writes $PREFIX/bin/aninext
 
-# optional: ffmpeg (HLS muxing), aria2 (faster downloads), yt-dlp, termux-api
+# optional: fzf (arrow-key picking), ffmpeg, aria2, yt-dlp, termux-api
 bash install.sh --with-extras
 termux-setup-storage          # run once, so downloads land in shared storage
 ```
@@ -62,6 +97,7 @@ or `python3 -m aninext ...`.
 ## Commands
 
 ```
+quick       search, pick and play (what `aninext <name>` runs)
 search      search for a title across providers       trending    what is popular right now
 info        show details for a title                  episodes    list episodes
 links       show streams, downloads and subtitles     play        resolve and play an episode
@@ -88,7 +124,10 @@ Anything a search prints can be referenced by number afterwards
 ### Examples
 
 ```bash
-aninext episodes frieren -n 10                   # newest first (--first flips it)
+aninext frieren                                 # search -> pick -> play
+aninext severance -s 2 -e 1                     # skip the pickers entirely
+aninext demo:severance                          # a reference works too, no search
+aninext episodes severance -s 2 -n 10           # newest first (--first flips it)
 aninext search "blade runner" -k movie --json | jq '.[0].title'
 aninext links frieren -e 1                      # streams, downloads and subtitles
 aninext play frieren -e 1 --quality 1080p       # mpv -> vlc -> termux-open -> xdg-open
@@ -181,6 +220,20 @@ allow it.
 Optional helpers make it better: `aria2c` for plain files, `ffmpeg` for HLS
 muxing and remuxing, `yt-dlp` as a last resort for hosts it knows.
 
+## Players
+
+`aninext play` (and the interactive flow) tries, in order:
+
+1. **mpv-android** (`is.xyz.mpv`) — handed the URL, the episode title, a
+   resume position and the subtitle tracks through an `am start` intent
+2. `mpv` (with `--start`, `--sub-files` and `--playlist` when useful)
+3. `vlc`, then any other Android app (`open_with`), then `termux-open`, then
+   `xdg-open`
+
+Set `--player mpv` (or `open_player` in the config) to force one. mpv-android
+cannot receive HTTP headers, so streams that need a `Referer` should be played
+with `mpv` instead — the app itself has no support for them.
+
 ## Library, history and watchlist
 
 Everything is one SQLite file (`~/.aninext/aninext.db`) with FTS5 search:
@@ -212,6 +265,11 @@ Environment overrides: `ANINEXT_HOME`, `ANINEXT_PROVIDER`, `ANINEXT_QUALITY`,
 `ANINEXT_DOWNLOAD_DIR`, `ANINEXT_WORKERS`, `ANINEXT_KIND`, `ANINEXT_LOG`,
 `ANINEXT_PLAYER`, `TMDB_API_KEY`, `NO_COLOR`.
 
+Picker-related: `ANINEXT_NO_FZF` (always use the numbered prompt),
+`ANINEXT_NO_PROMPT` (never prompt — print results instead),
+`ANINEXT_FZF_OPTIONS` (extra fzf flags), `ANINEXT_MPV_ANDROID=0|1` (pretend the
+app is/is not installed).
+
 ## Use it from Python
 
 ```python
@@ -231,7 +289,7 @@ api.download(title, episodes="1-3", quality="720p")
 ## Tests
 
 ```bash
-./tests/run.sh              # 213 tests, no network and no pip packages
+./tests/run.sh              # 288 tests, no network and no pip packages
 ./tests/run.sh -v
 ./tests/run.sh test_db      # a single module
 ```
@@ -240,6 +298,10 @@ The suite runs the real rule engine against the offline `demo` provider and
 local HTTP servers, so it exercises search, pagination, episode listing,
 packed-JS players, base64 embeds, downloads, resume, subtitles, the library
 database and the CLI without touching the internet.
+
+The interactive flow is tested with a stub `fzf` on `PATH` and a stub `am`, so
+the pickers, the season step and the mpv-android intent are covered for real —
+`tests/test_picker.py`, `tests/test_quick.py` and `tests/test_android.py`.
 
 ## Notes
 

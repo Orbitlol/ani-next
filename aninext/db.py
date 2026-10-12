@@ -10,13 +10,13 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from . import log
-from .models import Episode, HistoryEntry, Stream, Title
+from .models import HistoryEntry, Title
 from .paths import db_file
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS library (
 
 CREATE TABLE IF NOT EXISTS episodes (
     key         TEXT NOT NULL,
+    season      INTEGER NOT NULL DEFAULT 0,
     number      REAL NOT NULL,
     title       TEXT,
     url         TEXT,
@@ -53,7 +54,7 @@ CREATE TABLE IF NOT EXISTS episodes (
     progress    REAL DEFAULT 0,
     duration_s  REAL DEFAULT 0,
     updated_at  REAL,
-    PRIMARY KEY (key, number)
+    PRIMARY KEY (key, season, number)
 );
 
 CREATE TABLE IF NOT EXISTS watchlist (
@@ -72,6 +73,7 @@ CREATE TABLE IF NOT EXISTS history (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     title_key   TEXT,
     title       TEXT,
+    season      INTEGER DEFAULT 0,
     episode     REAL,
     episode_title TEXT,
     provider    TEXT,
@@ -85,6 +87,7 @@ CREATE TABLE IF NOT EXISTS downloads (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     title_key  TEXT,
     title      TEXT,
+    season     INTEGER DEFAULT 0,
     episode    REAL,
     quality    TEXT,
     url        TEXT,
@@ -105,7 +108,7 @@ CREATE TABLE IF NOT EXISTS cache (
 
 CREATE INDEX IF NOT EXISTS idx_history_time  ON history(watched_at DESC);
 CREATE INDEX IF NOT EXISTS idx_history_key   ON history(title_key, episode);
-CREATE INDEX IF NOT EXISTS idx_episodes_key  ON episodes(key, number);
+CREATE INDEX IF NOT EXISTS idx_episodes_key  ON episodes(key, season, number);
 CREATE INDEX IF NOT EXISTS idx_dl_status     ON downloads(status);
 """
 
@@ -165,8 +168,45 @@ class Database:
             self.conn.commit()
 
     def _migrate(self, from_version: int) -> None:
-        # v1 -> v2: nothing structural, just record. Future migrations go here.
         log.debug("database schema %s -> %s", from_version, SCHEMA_VERSION)
+        if from_version < 3:
+            # v2 -> v3: episodes are per season (numbers restart every season),
+            # and history/downloads remember which season an episode was in.
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS episodes_v3 (
+                    key         TEXT NOT NULL,
+                    season      INTEGER NOT NULL DEFAULT 0,
+                    number      REAL NOT NULL,
+                    title       TEXT,
+                    url         TEXT,
+                    thumbnail   TEXT,
+                    duration    TEXT,
+                    provider    TEXT,
+                    watched     INTEGER DEFAULT 0,
+                    progress    REAL DEFAULT 0,
+                    duration_s  REAL DEFAULT 0,
+                    updated_at  REAL,
+                    PRIMARY KEY (key, season, number)
+                );
+                INSERT OR IGNORE INTO episodes_v3
+                    (key, season, number, title, url, thumbnail, duration, provider,
+                     watched, progress, duration_s, updated_at)
+                    SELECT key, 0, number, title, url, thumbnail, duration, provider,
+                           watched, progress, duration_s, updated_at FROM episodes;
+                DROP TABLE episodes;
+                ALTER TABLE episodes_v3 RENAME TO episodes;
+                DROP INDEX IF EXISTS idx_episodes_key;
+                CREATE INDEX IF NOT EXISTS idx_episodes_key ON episodes(key, season, number);
+                """
+            )
+            for table in ("history", "downloads"):
+                columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+                if "season" not in columns:
+                    self.conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN season INTEGER DEFAULT 0"
+                    )
+            self.conn.commit()
 
     @staticmethod
     def _bind(params: Any) -> Any:
@@ -323,8 +363,8 @@ class Database:
         now = time.time()
         rows = [
             (
-                title.key, float(e.number), e.title, e.url, e.thumbnail, e.duration,
-                e.provider or title.provider, now,
+                title.key, int(e.season or 0), float(e.number), e.title, e.url, e.thumbnail,
+                e.duration, e.provider or title.provider, now,
             )
             for e in title.episodes
         ]
@@ -332,9 +372,9 @@ class Database:
             return 0
         self.conn.executemany(
             """
-            INSERT INTO episodes(key,number,title,url,thumbnail,duration,provider,updated_at)
-            VALUES(?,?,?,?,?,?,?,?)
-            ON CONFLICT(key,number) DO UPDATE SET
+            INSERT INTO episodes(key,season,number,title,url,thumbnail,duration,provider,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(key,season,number) DO UPDATE SET
                 title=excluded.title, url=excluded.url, thumbnail=excluded.thumbnail,
                 duration=excluded.duration, provider=excluded.provider,
                 updated_at=excluded.updated_at
@@ -352,20 +392,21 @@ class Database:
         rows = self.query("SELECT * FROM episodes WHERE key=? ORDER BY number", (key,))
         return [dict(r) for r in rows]
 
-    def episode_mark(self, key: str, number: float, *, watched: bool = True,
+    def episode_mark(self, key: str, number: float, *, season: int = 0, watched: bool = True,
                      progress: float | None = None, duration: float | None = None) -> None:
         now = time.time()
         self.execute(
             """
-            INSERT INTO episodes(key,number,watched,progress,duration_s,updated_at)
-            VALUES(?,?,?,?,?,?)
-            ON CONFLICT(key,number) DO UPDATE SET
+            INSERT INTO episodes(key,season,number,watched,progress,duration_s,updated_at)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(key,season,number) DO UPDATE SET
                 watched=excluded.watched,
                 progress=COALESCE(?, episodes.progress),
                 duration_s=COALESCE(?, episodes.duration_s),
                 updated_at=excluded.updated_at
             """,
-            (key, float(number), 1 if watched else 0, progress or 0, duration or 0, now, progress, duration),
+            (key, int(season or 0), float(number), 1 if watched else 0, progress or 0,
+             duration or 0, now, progress, duration),
         )
         if watched:
             self.execute(
@@ -374,20 +415,64 @@ class Database:
                 (key, now, key),
             )
 
-    def episode_progress(self, key: str) -> dict[float, dict]:
+    def episode_progress(self, key: str) -> dict[tuple[int, float], dict]:
+        """Watched/progress state, keyed by (season, number)."""
         rows = self.query("SELECT * FROM episodes WHERE key=?", (key,))
-        return {float(r["number"]): dict(r) for r in rows}
+        return {(int(r["season"] or 0), float(r["number"])): dict(r) for r in rows}
 
-    def next_unwatched(self, key: str) -> float | None:
+    def next_unwatched(self, key: str, season: int | None = None) -> float | None:
+        """The next episode to watch.
+
+        With a season: inside that season. Without one, and for shows that have
+        several seasons, we continue the season the user was last watching
+        (falling back to the first, then to the newest for what has not aired
+        yet) - episode numbers restart every season, so a plain MIN() would
+        happily send you back to season 1.
+        """
+        if season is None:
+            seasons = {
+                int(row["season"] or 0)
+                for row in self.query("SELECT DISTINCT season FROM episodes WHERE key=?", (key,))
+            }
+            if len(seasons) > 1:
+                return self._next_across_seasons(key, seasons)
+
+        if season is not None:
+            where, params = "key=? AND season=?", (key, int(season))
+        else:
+            where, params = "key=?", (key,)
         row = self.one(
-            "SELECT MIN(number) AS n FROM episodes WHERE key=? AND watched=0 AND number > 0", (key,)
+            f"SELECT MIN(number) AS n FROM episodes WHERE {where} AND watched=0 AND number > 0",
+            params,
         )
         if row and row["n"] is not None:
             return float(row["n"])
-        row = self.one("SELECT MAX(number) AS n FROM episodes WHERE key=? AND watched=1", (key,))
+        row = self.one(f"SELECT MAX(number) AS n FROM episodes WHERE {where} AND watched=1", params)
         if row and row["n"] is not None:
             return float(row["n"]) + 1
         return None
+
+    def _next_across_seasons(self, key: str, seasons: set[int]) -> float | None:
+        last = self.one(
+            "SELECT season FROM episodes WHERE key=? AND watched=1 AND season > 0 "
+            "ORDER BY updated_at DESC, number DESC LIMIT 1",
+            (key,),
+        )
+        ordered = sorted(s for s in seasons if s > 0) or [0]
+        start = int(last["season"]) if last and int(last["season"]) in ordered else ordered[0]
+        for candidate in [s for s in ordered if s >= start]:
+            number = self.next_unwatched(key, season=candidate)
+            if number is None:
+                continue
+            known = self.one(
+                "SELECT 1 FROM episodes WHERE key=? AND season=? AND number=? AND watched=0",
+                (key, candidate, number),
+            )
+            if known:
+                return number
+        # nothing left to watch in any season: offer whatever comes after the
+        # newest one, which is how ongoing shows announce new episodes
+        return self.next_unwatched(key, season=ordered[-1])
 
     # -- watchlist ---------------------------------------------------------
 
@@ -434,6 +519,7 @@ class Database:
             data = {
                 "title_key": entry.title_key,
                 "title": entry.title,
+                "season": entry.season,
                 "episode": entry.episode,
                 "episode_title": entry.episode_title,
                 "provider": entry.provider,
@@ -443,17 +529,20 @@ class Database:
             }
         else:
             data = dict(entry)
+            data.setdefault("season", 0)      # plain dicts may not carry one
+        data.setdefault("season", 0)
         data["watched_at"] = data.get("watched_at") or time.time()
         self.execute(
             """
-            INSERT INTO history(title_key,title,episode,episode_title,provider,url,
+            INSERT INTO history(title_key,title,season,episode,episode_title,provider,url,
                                 position,duration,watched_at)
-            VALUES(:title_key,:title,:episode,:episode_title,:provider,:url,
+            VALUES(:title_key,:title,:season,:episode,:episode_title,:provider,:url,
                    :position,:duration,:watched_at)
             """,
             {
                 "title_key": data.get("title_key", ""),
                 "title": data.get("title", ""),
+                "season": int(data.get("season") or 0),
                 "episode": float(data.get("episode") or 0),
                 "episode_title": data.get("episode_title", ""),
                 "provider": data.get("provider", ""),
@@ -465,14 +554,16 @@ class Database:
         )
         key = data.get("title_key")
         if key:
+            # remember where the user stopped watching, so playback can resume
             self.execute(
                 "UPDATE episodes SET watched=1, progress=?, duration_s=?, updated_at=? "
-                "WHERE key=? AND number=?",
+                "WHERE key=? AND season=? AND number=?",
                 (
                     float(data.get("position") or 0),
                     float(data.get("duration") or 0),
                     time.time(),
                     key,
+                    int(data.get("season") or 0),
                     float(data.get("episode") or 0),
                 ),
             )
@@ -542,16 +633,18 @@ class Database:
     # -- downloads ---------------------------------------------------------
 
     def download_add(self, *, title_key: str, title: str, episode: float, quality: str,
+                     season: int = 0,
                      url: str, path: str = "", size: int = 0, provider: str = "",
                      status: str = "queued") -> int:
         now = time.time()
         cur = self.execute(
             """
-            INSERT INTO downloads(title_key,title,episode,quality,url,path,size,status,
+            INSERT INTO downloads(title_key,title,season,episode,quality,url,path,size,status,
                                   provider,added_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            (title_key, title, float(episode), quality, url, path, size, status, provider, now, now),
+            (title_key, title, int(season or 0), float(episode), quality, url, path, size,
+             status, provider, now, now),
         )
         return int(cur.lastrowid or 0)
 

@@ -231,7 +231,7 @@ class Title:
 
     def __post_init__(self) -> None:
         self.title = _clean(self.title)
-        if not self.slug:
+        if not self.slug and self.title:
             self.slug = slugify(self.title)
         self.kind = (self.kind or "anime").lower()
         self.genres = [_clean(g) for g in self.genres if _clean(g)]
@@ -243,9 +243,20 @@ class Title:
             self.total_episodes = len(self.episodes)
 
     @property
+    def url_slug(self) -> str:
+        """Our slug for the title, derived lazily.
+
+        Providers build a `Title` and only assign the name afterwards, so the
+        slug cannot always be computed in `__post_init__`.
+        """
+        if self.slug and self.slug != "untitled":
+            return self.slug
+        return slugify(self.title) if self.title else (self.slug or "untitled")
+
+    @property
     def key(self) -> str:
         """Stable identifier used for library/history rows."""
-        return self.id or f"{self.provider}:{self.slug or slugify(self.title)}"
+        return self.id or f"{self.provider}:{self.url_slug}"
 
     def sorted_episodes(self) -> list[Episode]:
         return sorted(self.episodes, key=lambda e: (e.season, e.number))
@@ -263,7 +274,7 @@ class Title:
             "kind": self.kind,
             "provider": self.provider,
             "id": self.id,
-            "slug": self.slug,
+            "slug": self.url_slug,
             "key": self.key,
             "alt_titles": self.alt_titles,
             "synopsis": self.synopsis,
@@ -323,6 +334,7 @@ class SearchResult:
 class HistoryEntry:
     title: str
     episode: float
+    season: int = 0
     episode_title: str = ""
     provider: str = ""
     title_key: str = ""

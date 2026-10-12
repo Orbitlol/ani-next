@@ -25,7 +25,10 @@ def run(*argv: str) -> tuple[int, str]:
     buf = io.StringIO()
     err = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
-        code = cli.main(list(argv))
+        try:
+            code = cli.main(list(argv))
+        except SystemExit as exc:      # argparse: `--help`, `--version`, bad args
+            code = int(exc.code or 0)
     LAST_ERR = err.getvalue()
     return code, buf.getvalue()
 
@@ -237,10 +240,17 @@ class TestCliCommands(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["title"], "Frieren: Beyond Journey's End")
 
-    def test_help_without_command(self) -> None:
+    def test_home_screen_without_command(self) -> None:
         code, out = run()
         self.assertEqual(code, 0)
+        self.assertIn("what do you want to watch", out.lower())
+        self.assertIn("aninext frieren", out)
+
+    def test_help_flag(self) -> None:
+        code, out = run("--help")
+        self.assertEqual(code, 0)
         self.assertIn("usage", out.lower())
+        self.assertIn("quick", out)
 
 
 if __name__ == "__main__":  # pragma: no cover

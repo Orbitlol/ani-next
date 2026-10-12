@@ -2,7 +2,7 @@
 # aninext installer for Termux (also works on plain Linux).
 #
 #   bash install.sh            # install aninext itself
-#   bash install.sh --with-extras   # also install ffmpeg, aria2, yt-dlp, termux-api
+#   bash install.sh --with-extras   # also install fzf, ffmpeg, aria2, termux-api
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,9 +37,10 @@ say "using $($PY -V 2>&1)"
 if [ -n "${TERMUX_VERSION:-}" ] || [ -d /data/data/com.termux ]; then
   say "Termux detected"
   if [ "$WITH_EXTRAS" = "1" ]; then
-    say "installing optional tools (ffmpeg, aria2, yt-dlp, termux-api)"
+    say "installing optional tools (fzf, ffmpeg, aria2, termux-api)"
     pkg update -y || warn "pkg update failed, continuing"
-    pkg install -y ffmpeg aria2 python-pip termux-api || warn "some packages failed"
+    pkg install -y fzf ffmpeg aria2 python-pip termux-api || warn "some packages failed"
+    warn "for arrow-key picking you need fzf; install the mpv-android app to watch"
     command -v yt-dlp >/dev/null 2>&1 || pip install --quiet yt-dlp || warn "yt-dlp not installed"
   fi
   if [ ! -d "$HOME/storage" ]; then
